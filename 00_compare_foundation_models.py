@@ -76,7 +76,7 @@ plt.rcParams.update({
 })
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-MY_HF_TOKEN = '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'
+MY_HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Color scheme for paper
 FM_COLORS = {

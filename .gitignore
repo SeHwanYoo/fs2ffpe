@@ -20,3 +20,4 @@ __pycache__/
 *.pt
 brain_rag/
 rag/kirc_cache/
+.env
