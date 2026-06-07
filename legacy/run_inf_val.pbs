@@ -1,0 +1,27 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+#PBS -N TEST_VAL
+#PBS -P gs_lkc_wilsongoh
+#PBS -q gpu_a40
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -j oe
+# ---------------------------------------------------------------------------
+
+cd $PBS_O_WORKDIR
+
+source ~/.bashrc
+module load cuda/12.9
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate sdxl_train_py312
+
+
+echo "🚀 Job Start Time: $(date)"
+echo "Current Node: $(hostname)"
+echo "Using GPU: $CUDA_VISIBLE_DEVICES"
+
+export PYTHONPATH=$PBS_O_WORKDIR:$PYTHONPATH
+
+python -u scripts/translate_images.py "outdir/deepthaw/model_m(uvcgan2-deepthaw)_d(basic)_g(vit-modnet)_v2-uni-full" --split val --epoch 200 > progress_test_val.txt 2>&1
+
+echo "✅ Job Finished Time: $(date)"

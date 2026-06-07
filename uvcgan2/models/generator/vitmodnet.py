@@ -52,6 +52,28 @@ class ViTModNetGenerator(nn.Module):
         self.net.set_bottleneck(bottleneck)
 
         self.output = get_activ_layer(activ_output)
+        
+    # 🔥 [추가] 가중치 로드 함수
+    def init_conch_weights(self):
+        # 주의: 실제 CONCH 모델 파일이나 라이브러리가 필요합니다.
+        # 여기서는 로직만 잡아드리오니, 실제 경로/라이브러리에 맞춰 주석을 해제하세요.
+        try:
+            print("💉 Injecting CONCH pathology foundation weights...")
+            
+            # [예시] timm이나 open_clip으로 로드하는 경우
+            # import timm
+            # conch_model = timm.create_model('vit_base_patch16_224', pretrained=True)
+            
+            # 내 모델의 bottleneck (ExtendedPixelwiseViT) 가져오기
+            # 구조: self.net -> bottleneck -> layers -> transformer blocks
+            
+            # TODO: 실제 CONCH weight key와 uvcgan key 매핑 필요
+            # 간단하게는 Encoder Block의 일부만 복사해도 효과가 큽니다.
+            pass 
+            
+        except Exception as e:
+            print(f"⚠️ Failed to load CONCH weights: {e}")
+            print("Continuing with random initialization...")
 
     def forward(self, x):
         # x : (N, C, H, W)

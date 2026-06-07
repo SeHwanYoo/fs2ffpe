@@ -1,0 +1,118 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+#PBS -N GEN_STRICT
+#PBS -P gs_lkc_wilsongoh
+#PBS -q gpu_v100
+#PBS -l walltime=50:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -j oe
+# ---------------------------------------------------------------------------
+
+set -Eeo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+LOG="./progress_gen_strict_${PBS_JOBID}.log"
+exec > >(tee -a "$LOG") 2>&1
+
+trap 'echo "❌ ERROR at line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+echo "============================================================"
+echo "🚀 Job Start: $(date)"
+echo "PWD: $(pwd)"
+echo "Node: $(hostname)"
+echo "GPU: ${CUDA_VISIBLE_DEVICES:-NONE}"
+echo "Log: $LOG"
+echo "============================================================"
+
+source ~/.bashrc
+module load anaconda2025/2025-gpu
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate sdxl_train_py312
+
+echo "Python: $(which python)"
+python --version
+
+# ============================================================
+# Paths
+# ============================================================
+INPUT_DIR="/home/sehwan001/datasets/patches/patches"
+GEN_BS_DIR="/home/sehwan001/datasets/gen_bs"
+LABEL_FILE="/home/sehwan001/projects/make_dataset/kirc/kirc_pbrm1_labels.csv"
+
+# GT 실험에서 만든 split 재사용
+GT_SPLIT_JSON="./rag/kirc_cache/split.json"
+
+# GEN-BS용 RAG cache
+RAG_CACHE_GEN="./rag/kirc_cache_gen"
+
+# Output
+OUT_ROOT="./outputs/kirc_gen"
+
+echo "============================================================"
+echo "Checking files and folders"
+echo "============================================================"
+
+ls -lh 01_precompute_rag.py
+ls -lh 01_train.py
+
+ls -ld "$INPUT_DIR"
+ls -ld "$GEN_BS_DIR"
+ls -lh "$LABEL_FILE"
+
+if [ ! -f "$GT_SPLIT_JSON" ]; then
+    echo "❌ Missing GT split json: $GT_SPLIT_JSON"
+    echo "GT TS+GT BS RAG를 먼저 돌려서 ./rag/kirc_cache/split.json 을 만들어야 함."
+    exit 1
+fi
+
+mkdir -p "$RAG_CACHE_GEN"
+mkdir -p "$OUT_ROOT"
+
+# echo "============================================================"
+# echo "Step 1. Precompute RAG cache: GT TS + GEN BS-like"
+# echo "============================================================"
+
+# python -u 01_precompute_rag.py \
+#   --input-dir "$INPUT_DIR" \
+#   --gen-dir "$GEN_BS_DIR" \
+#   --split-json "$GT_SPLIT_JSON" \
+#   --label-file "$LABEL_FILE" \
+#   --patient-col CASE_ID \
+#   --label-col label \
+#   --output-dir "$RAG_CACHE_GEN" \
+#   --k 5 \
+#   --batch-size 128 \
+#   --num-workers 8
+
+echo "============================================================"
+echo "Step 2. Check GEN RAG cache"
+echo "============================================================"
+
+ls -lh "$RAG_CACHE_GEN"
+ls -lh "$RAG_CACHE_GEN/train/rag_lookup.pt"
+ls -lh "$RAG_CACHE_GEN/test/rag_lookup.pt"
+
+echo "============================================================"
+echo "Step 3. Train: GT TS + GEN BS-like -> GT DX/FFPE"
+echo "============================================================"
+
+python -u 01_train.py \
+  --preset uni-full \
+  --data-path "$INPUT_DIR" \
+  --gen-dir "$GEN_BS_DIR" \
+  --split-json "$GT_SPLIT_JSON" \
+  --rag-cache-dir "$RAG_CACHE_GEN" \
+  --label kirc_unifull \
+  --run-tag gt-ts-gen-bs \
+  --out-root "$OUT_ROOT" \
+  --batch-size 4 \
+  --epochs 200 \
+  --steps-per-epoch 1000 \
+  --checkpoint-every 10 \
+  --no-pretrain \
+  --rebuild-auto-data
+
+echo "============================================================"
+echo "✅ Job Finished: $(date)"
+echo "============================================================"

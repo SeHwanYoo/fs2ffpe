@@ -14,10 +14,18 @@ class TrainingHistory:
         values['epoch'] = epoch
         values['time']  = pd.Timestamp.utcnow()
 
+        # if self._history is None:
+        #     self._history = pd.DataFrame([ values, ])
+        # else:
+        #     self._history = self._history.append([ values, ])
+        
+        new_row = pd.DataFrame([values])
+
         if self._history is None:
-            self._history = pd.DataFrame([ values, ])
+            self._history = new_row
         else:
-            self._history = self._history.append([ values, ])
+            # append 대신 concat 사용 (Pandas 2.0+ 호환)
+            self._history = pd.concat([self._history, new_row], ignore_index=True)
 
         self.save()
 

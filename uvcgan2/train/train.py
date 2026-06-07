@@ -24,6 +24,11 @@ def training_epoch(it_train, model, title, steps_per_epoch):
     for batch in islice(it_train, steps):
         model.set_input(batch)
         model.optimization_step()
+        
+        # ====== DeepThaw: ArtifactNet 업데이트 ======
+        if hasattr(model, 'update_artifact_net'):
+            model.update_artifact_net()
+        # ============================================
 
         metrics.update(model.get_current_losses())
 
@@ -69,6 +74,12 @@ def train(args_dict):
         transfer(model, args.transfer)
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
+        
+        # ====== DeepThaw: 현재 epoch 설정 ======
+        if hasattr(model, 'set_epoch'):
+            model.set_epoch(epoch)
+        # ========================================
+
         title   = 'Epoch %d / %d' % (epoch, args.epochs)
         metrics = training_epoch(
             it_train, model, title, args.config.steps_per_epoch

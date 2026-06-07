@@ -1,0 +1,25 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+#PBS -N ALL_PROOF_1
+#PBS -P gs_lkc_wilsongoh
+#PBS -q gpu_a40
+#PBS -l walltime=74:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -j oe
+# ---------------------------------------------------------------------------
+
+cd $PBS_O_WORKDIR
+
+source ~/.bashrc
+module load cuda/12.9
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate sdxl_train_py312
+
+
+echo "🚀 Job Start Time: $(date)"
+echo "Current Node: $(hostname)"
+echo "Using GPU: $CUDA_VISIBLE_DEVICES"
+
+python -u train_fs2ffpe_v2.py --preset uni-full --rag-cache-dir /home/sehwan001/projects/deepthaw/rag_cache_uni --data-path /home/sehwan001/datasets/linked_v2/FS2FFPE --no-pretrain > log_train_fs2ffpe_v2.log 2>&1
+
+echo "✅ Job Finished Time: $(date)"

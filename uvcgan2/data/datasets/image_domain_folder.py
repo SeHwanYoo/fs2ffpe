@@ -8,23 +8,13 @@ from uvcgan2.consts import SPLIT_TRAIN
 class ImageDomainFolder(Dataset):
     """Dataset structure introduced in a CycleGAN paper.
 
-    This dataset expects images to be arranged into subdirectories
-    under `path`: `trainA`, `trainB`, `testA`, `testB`. Here, `trainA`
-    subdirectory contains training images from domain "a", `trainB`
-    subdirectory contains training images from domain "b", and so on.
-
-    Parameters
-    ----------
-    path : str
-        Path where the dataset is located.
-    domain : str
-        Choices: 'a', 'b'.
-    split : str
-        Choices: 'train', 'test', 'val'
-    transform : Callable or None,
-        Optional transformation to apply to images.
-        E.g. torchvision.transforms.RandomCrop.
-        Default: None
+    Modified for FS->FFPE:
+    - recursively scans nested slide folders;
+    - follows symlinks;
+    - supports linked datasets such as:
+        trainA/TCGA-...-TS1/*.png
+        trainA/TCGA-...-BS1/*.png
+        trainA/BS/TCGA-...-TS1/*.png
     """
 
     def __init__(
@@ -44,20 +34,26 @@ class ImageDomainFolder(Dataset):
 
     @staticmethod
     def find_images_in_dir(path):
-        extensions = set(IMG_EXTENSIONS)
+        extensions = {ext.lower() for ext in IMG_EXTENSIONS}
+
+        if not os.path.exists(path):
+            fallback = os.path.join(
+                os.path.dirname(os.path.dirname(path)),
+                os.path.basename(path)
+            )
+            if os.path.exists(fallback):
+                path = fallback
+
+        if not os.path.exists(path):
+            return []
 
         result = []
-        for fname in os.listdir(path):
-            fullpath = os.path.join(path, fname)
-
-            if not os.path.isfile(fullpath):
-                continue
-
-            ext = os.path.splitext(fname)[1]
-            if ext not in extensions:
-                continue
-
-            result.append(fullpath)
+        for root, _, fnames in os.walk(path, followlinks=True):
+            for fname in fnames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in extensions:
+                    continue
+                result.append(os.path.join(root, fname))
 
         result.sort()
         return result
@@ -73,4 +69,3 @@ class ImageDomainFolder(Dataset):
             result = self._transform(result)
 
         return result
-

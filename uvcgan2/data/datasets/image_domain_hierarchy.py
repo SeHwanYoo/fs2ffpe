@@ -1,3 +1,5 @@
+from PIL import PngImagePlugin
+PngImagePlugin.MAX_TEXT_CHUNK = 200 * (1024 ** 2)
 import os
 
 from torch.utils.data import Dataset
@@ -16,7 +18,22 @@ class ImageDomainHierarchy(Dataset):
     ):
         super().__init__(**kwargs)
 
-        self._path      = os.path.join(path, split, domain)
+        candidates = [
+            os.path.join(path, split, domain),
+            os.path.join(path, split, domain.upper()),
+            os.path.join(path, split + domain.upper()),
+            os.path.join(path, split + domain.lower()),
+        ]
+
+        self._path = None
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                self._path = candidate
+                break
+
+        if self._path is None:
+            self._path = os.path.join(path, split, domain)
+
         self._imgs      = ImageDomainFolder.find_images_in_dir(self._path)
         self._transform = transform
 
@@ -31,4 +48,3 @@ class ImageDomainHierarchy(Dataset):
             result = self._transform(result)
 
         return result
-

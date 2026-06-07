@@ -3,6 +3,7 @@ from .pix2pix            import Pix2PixModel
 from .autoencoder        import Autoencoder
 from .simple_autoencoder import SimpleAutoencoder
 from .uvcgan2            import UVCGAN2
+from .uvcgan2_deepthaw   import UVCGAN2DeepThaw
 
 CGAN_MODELS = {
     'cyclegan'           : CycleGANModel,
@@ -10,6 +11,7 @@ CGAN_MODELS = {
     'autoencoder'        : Autoencoder,
     'simple-autoencoder' : SimpleAutoencoder,
     'uvcgan2'            : UVCGAN2,
+    'uvcgan2-deepthaw'   : UVCGAN2DeepThaw,
 }
 
 def select_model(name, **kwargs):
@@ -25,4 +27,3 @@ def construct_model(savedir, config, is_train, device):
     )
 
     return model
-

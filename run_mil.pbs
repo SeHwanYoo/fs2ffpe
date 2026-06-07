@@ -1,0 +1,38 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+#PBS -N DX_MIL
+#PBS -P gs_lkc_wilsongoh
+#PBS -q gpu_v100
+#PBS -l walltime=20:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -j oe
+# ---------------------------------------------------------------------------
+
+cd $PBS_O_WORKDIR
+
+source ~/.bashrc
+module load anaconda2025/2025-gpu
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate sdxl_train_py312
+
+echo "🚀 Job Start Time: $(date)"
+echo "Current Node: $(hostname)"
+echo "Using GPU: $CUDA_VISIBLE_DEVICES"
+
+
+python -u 00_mil_kfold_ffpe_uni.py \
+  --csv_file /home/sehwan001/projects/make_dataset/lung/gdc_manifest_luad_kras_balanced.tsv \
+  --csv_sep tab \
+  --patch_dir /home/sehwan001/datasets/patches \
+  --slide_type_filter DX \
+  --out_dir ./mil_results_ffpe_real_uni \
+  --id_col patient_id \
+  --label_col label \
+  --n_splits 5 \
+  --epochs 30 \
+  --batch_size 128 \
+  --num_workers 4 \
+  --max_patches_per_bag 1500 > progress_mil_real_ffpe_log.txt 2>&1
+
+
+echo "✅ Job Finished Time: $(date)"

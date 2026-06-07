@@ -113,17 +113,8 @@ class ImagePatchRandomMasking(nn.Module):
 # 
 #         return image
 
+
 def select_masking(masking):
     if masking is None:
         return None
-
-    name, kwargs = extract_name_kwargs(masking)
-
-    if name in [ 'transformer-random', 'sequence-random' ]:
-        return SequenceRandomMasking(**kwargs)
-
-    if name == 'image-patch-random':
-        return ImagePatchRandomMasking(**kwargs)
-
-    raise ValueError("Unknown masking: '%s'" % name)
-
+    raise ValueError('Unknown masking: %s' % masking)

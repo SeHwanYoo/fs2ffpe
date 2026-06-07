@@ -37,7 +37,12 @@ class ModelBase:
         if is_train:
             self.optimizers = self._setup_optimizers(config)
             self.schedulers = self._setup_schedulers(config)
-
+            
+        # ====== DeepThaw Components ======
+        self.self_challenging = None
+        self.artifact_net = None
+        self.artifact_scheduler = None
+        
     def set_input(self, inputs, domain = None):
         for key in self.images:
             self.images[key] = None

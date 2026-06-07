@@ -1,4 +1,19 @@
-outdir/
-__pycache__
-*.egg-info/
-*.swp
+# PBS 스크립트 및 작업 로그 제외
+*.o[0-9]*
+*.e[0-9]*
+*.log
+
+# 데이터 및 대용량 실험 결과물 폴더 제외
+outputs/
+mil_results_ffpe_real_uni/
+figures/
+figures2/
+logs/
+@outdir/
+
+# 시스템 및 파이썬 캐시 제외
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+*.npy

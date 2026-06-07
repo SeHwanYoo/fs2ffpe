@@ -20,6 +20,9 @@ from .model_base import ModelBase
 from .named_dict import NamedDict
 from .funcs import set_two_domain_input
 
+from uvcgan2.torch.deepthaw_loss import SelfChallengingLoss, ProgressiveScheduler
+from uvcgan2.models.artifact_net import ArtifactNet
+
 class CycleGANModel(ModelBase):
     # pylint: disable=too-many-instance-attributes
 
@@ -176,29 +179,92 @@ class CycleGANModel(ModelBase):
             self.models.disc_a, self.images.real_a, fake_a
         )
 
+    # def backward_generators(self):
+    #     lambda_idt = self.lambda_idt
+    #     lambda_a   = self.lambda_a
+    #     lambda_b   = self.lambda_b
+
+    #     self.losses.gen_ab = self.criterion_gan(
+    #         self.models.disc_b(self.images.fake_b), True
+    #     )
+    #     self.losses.gen_ba = self.criterion_gan(
+    #         self.models.disc_a(self.images.fake_a), True
+    #     )
+    #     self.losses.cycle_a = lambda_a * self.criterion_cycle(
+    #         self.images.reco_a, self.images.real_a
+    #     )
+    #     self.losses.cycle_b = lambda_b * self.criterion_cycle(
+    #         self.images.reco_b, self.images.real_b
+    #     )
+
+    #     loss = (
+    #           self.losses.gen_ab  + self.losses.gen_ba
+    #         + self.losses.cycle_a + self.losses.cycle_b
+    #     )
+
+    #     if lambda_idt > 0:
+    #         self.images.idt_b = self.models.gen_ab(self.images.real_b)
+    #         self.losses.idt_b = lambda_b * lambda_idt * self.criterion_idt(
+    #             self.images.idt_b, self.images.real_b
+    #         )
+
+    #         self.images.idt_a = self.models.gen_ba(self.images.real_a)
+    #         self.losses.idt_a = lambda_a * lambda_idt * self.criterion_idt(
+    #             self.images.idt_a, self.images.real_a
+    #         )
+
+    #         loss += (self.losses.idt_a + self.losses.idt_b)
+
+    #     loss.backward()
+    
+    
     def backward_generators(self):
+        """DeepThaw: PAI + Self-Challenging 포함 버전."""
+        
         lambda_idt = self.lambda_idt
         lambda_a   = self.lambda_a
         lambda_b   = self.lambda_b
 
+        # ========================================
+        # 1. GAN Loss (기존과 동일)
+        # ========================================
         self.losses.gen_ab = self.criterion_gan(
             self.models.disc_b(self.images.fake_b), True
         )
         self.losses.gen_ba = self.criterion_gan(
             self.models.disc_a(self.images.fake_a), True
         )
-        self.losses.cycle_a = lambda_a * self.criterion_cycle(
-            self.images.reco_a, self.images.real_a
-        )
-        self.losses.cycle_b = lambda_b * self.criterion_cycle(
-            self.images.reco_b, self.images.real_b
-        )
+        
+        # ========================================
+        # 2. Cycle Loss + Self-Challenging 🔥
+        # ========================================
+        if self.self_challenging is not None:
+            # Self-Challenging: 어려운 영역에 더 높은 weight
+            loss_cycle_a, _ = self.self_challenging(
+                self.images.reco_a, self.images.real_a, self.models.disc_a
+            )
+            loss_cycle_b, _ = self.self_challenging(
+                self.images.reco_b, self.images.real_b, self.models.disc_b
+            )
+            self.losses.cycle_a = lambda_a * loss_cycle_a
+            self.losses.cycle_b = lambda_b * loss_cycle_b
+        else:
+            # 기존 방식
+            self.losses.cycle_a = lambda_a * self.criterion_cycle(
+                self.images.reco_a, self.images.real_a
+            )
+            self.losses.cycle_b = lambda_b * self.criterion_cycle(
+                self.images.reco_b, self.images.real_b
+            )
 
         loss = (
-              self.losses.gen_ab  + self.losses.gen_ba
+            self.losses.gen_ab  + self.losses.gen_ba
             + self.losses.cycle_a + self.losses.cycle_b
         )
 
+        # ========================================
+        # 3. Identity Loss (기존과 동일)
+        # ========================================
         if lambda_idt > 0:
             self.images.idt_b = self.models.gen_ab(self.images.real_b)
             self.losses.idt_b = lambda_b * lambda_idt * self.criterion_idt(
@@ -211,6 +277,39 @@ class CycleGANModel(ModelBase):
             )
 
             loss += (self.losses.idt_a + self.losses.idt_b)
+
+        # ========================================
+        # 4. Progressive Artifact Injection 🔥🔥
+        # ========================================
+        if self.artifact_net is not None and self.artifact_scheduler is not None:
+            strength = self.artifact_scheduler.get_strength(self.current_epoch)
+            
+            if strength > 0:
+                with torch.no_grad():
+                    # FFPE → synthetic FS
+                    synthetic_fs = self.models.gen_ba(self.images.real_b).detach()
+                
+                # Artifact 주입
+                corrupted_fs, artifact_map = self.artifact_net(
+                    synthetic_fs, strength=strength
+                )
+                
+                # Corrupted FS → restored FFPE
+                restored_ffpe = self.models.gen_ab(corrupted_fs)
+                
+                # Loss: 복구된 FFPE가 원본과 같아야 함
+                self.losses.artifact = self.lambda_artifact * self.criterion_cycle(
+                    restored_ffpe, self.images.real_b
+                )
+                
+                loss += self.losses.artifact
+                
+                # 저장 (로깅/시각화용)
+                self.images.synthetic_fs = synthetic_fs
+                self.images.corrupted_fs = corrupted_fs
+                self.images.artifact_map = artifact_map
+                self.images.restored_ffpe = restored_ffpe
+                self.losses.artifact_strength = strength
 
         loss.backward()
 
@@ -228,4 +327,46 @@ class CycleGANModel(ModelBase):
         self.optimizers.disc.zero_grad()
         self.backward_discriminators()
         self.optimizers.disc.step()
+        
+    
+    def set_epoch(self, epoch):
+        """현재 epoch 설정. train loop에서 매 epoch마다 호출."""
+        self.current_epoch = epoch
+
+
+    def update_artifact_net(self):
+        """
+        ArtifactNet 업데이트. backward_generators() 후에 호출.
+        
+        ArtifactNet은 Generator가 복구 못하게 만들고 싶음 (adversarial).
+        """
+        if self.artifact_net is None or self.artifact_scheduler is None:
+            return
+        
+        strength = self.artifact_scheduler.get_strength(self.current_epoch)
+        if strength <= 0:
+            return
+        
+        self.artifact_optimizer.zero_grad()
+        
+        with torch.no_grad():
+            synthetic_fs = self.models.gen_ba(self.images.real_b).detach()
+        
+        corrupted_fs, artifact_map = self.artifact_net(
+            synthetic_fs, strength=strength
+        )
+        
+        # Generator forward (gradient 필요)
+        restored_ffpe = self.models.gen_ab(corrupted_fs)
+        
+        # ArtifactNet Loss: Generator가 실패하길 원함
+        recon_error = torch.abs(restored_ffpe.detach() - self.images.real_b).mean()
+        loss_adv = -recon_error  # maximize error
+        loss_reg = artifact_map.mean() * 0.1  # artifact 크기 제한
+        
+        loss_artifact_net = loss_adv + loss_reg
+        loss_artifact_net.backward()
+        
+        self.artifact_optimizer.step()
+
 

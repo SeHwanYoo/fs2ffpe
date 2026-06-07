@@ -1,0 +1,389 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+#PBS -N GT_GRADE_PIPE
+#PBS -P gs_lkc_wilsongoh
+#PBS -q gpu_v100
+#PBS -l walltime=50:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -j oe
+# ---------------------------------------------------------------------------
+
+set -Eeo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+LOG="./progress_pipeline_gt_grade_${PBS_JOBID}.log"
+exec > >(tee -a "$LOG") 2>&1
+trap 'echo "❌ ERROR line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+die(){ echo "❌ $*" >&2; exit 1; }
+
+log "============================================================"
+log "🚀 KIRC GRADE GT pipeline start"
+log "PWD: $(pwd)"
+log "Node: $(hostname)"
+log "GPU: ${CUDA_VISIBLE_DEVICES:-NONE}"
+log "Log: $LOG"
+log "============================================================"
+
+source ~/.bashrc
+module load anaconda2025/2025-gpu
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate sdxl_train_py312
+
+# ============================================================
+# IMPORTANT PATHS
+# ============================================================
+# Raw folders must contain TCGA-...-TS1 / TCGA-...-BS1 / TCGA-...-DX1 folders.
+RAW_DIR="/home/sehwan001/datasets/patches/patches"
+
+# This is the correct label file for KIRC grade binary classification.
+LABEL_FILE="/home/sehwan001/projects/make_dataset/kirc/kirc_grade_labels_binary.csv"
+
+# Do NOT train directly on RAW_DIR. 01_train.py expects trainA/trainB/testA/testB.
+LINK_ROOT="/home/sehwan001/datasets"
+DATA_DIR="$LINK_ROOT/kirc_grade_gt_ts_bs"
+
+# Keep this separate from old PBRM1 / ambiguous caches.
+RAG_CACHE="./rag/kirc_cache_grade"
+OUT_ROOT="./outputs/kirc_grade_gt"
+
+# 1 = rebuild linked trainA/trainB/testA/testB every run.
+# This only removes hardlinks/symlinks under DATA_DIR, not RAW_DIR.
+CLEAN_LINKED_DATA=1
+
+mkdir -p "$LINK_ROOT" "$OUT_ROOT"
+
+log "RAW_DIR    : $RAW_DIR"
+log "LABEL_FILE : $LABEL_FILE"
+log "DATA_DIR   : $DATA_DIR"
+log "RAG_CACHE  : $RAG_CACHE"
+log "OUT_ROOT   : $OUT_ROOT"
+
+[[ -d "$RAW_DIR" ]] || die "RAW_DIR not found: $RAW_DIR"
+[[ -f "$LABEL_FILE" ]] || die "LABEL_FILE not found: $LABEL_FILE"
+
+extract_case_id() {
+  echo "$1" | grep -Eio 'TCGA-[A-Z0-9]{2}-[A-Z0-9]{4}' | head -n 1 | tr '[:lower:]' '[:upper:]'
+}
+
+is_ts_like(){ echo "$1" | grep -Eiq '(^|[-_/\\])TS[0-9]*($|[-_.\\/])'; }
+is_bs_like(){ echo "$1" | grep -Eiq '(^|[-_/\\])BS[0-9]*($|[-_.\\/])'; }
+is_dx_like(){ echo "$1" | grep -Eiq '(^|[-_/\\])DX[0-9]*($|[-_.\\/])'; }
+
+extract_json_array() {
+  local key="$1"
+  local file="$2"
+  awk -v key="\"${key}\"" '
+    $0 ~ key {
+      flag=1
+      line=$0
+      sub(/^.*\[/, "", line)
+      if (line ~ /\]/) {
+        sub(/\].*$/, "", line)
+        gsub(/[", ]/, "", line)
+        if (length(line) > 0) print toupper(line)
+        flag=0
+        next
+      }
+      next
+    }
+    flag {
+      if ($0 ~ /\]/) { flag=0; next }
+      line=$0
+      gsub(/[", ]/, "", line)
+      if (length(line) > 0) print toupper(line)
+    }
+  ' "$file"
+}
+
+link_tree() {
+  local src="$1"
+  local dst_parent="$2"
+  local name
+  name="$(basename "$src")"
+
+  mkdir -p "$dst_parent"
+
+  if [[ -e "$dst_parent/$name" || -L "$dst_parent/$name" ]]; then
+    return 0
+  fi
+
+  # Hardlink tree: no data copy. Fallback to symlink tree if hardlink fails.
+  if cp -al "$src" "$dst_parent/" 2>/dev/null; then
+    return 0
+  fi
+
+  cp -as "$src" "$dst_parent/"
+}
+
+count_images() {
+  local d="$1"
+  find -L "$d" -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.tif" -o -iname "*.tiff" -o -iname "*.webp" \) | wc -l
+}
+
+build_gt_links() {
+  local input_dir="$1"
+  local split_json="$2"
+  local out_dir="$3"
+
+  [[ -d "$input_dir" ]] || die "input_dir not found: $input_dir"
+  [[ -f "$split_json" ]] || die "split_json not found: $split_json"
+
+  declare -gA TRAIN_CASES=()
+  declare -gA TEST_CASES=()
+
+  while IFS= read -r pid; do [[ -n "$pid" ]] && TRAIN_CASES["$pid"]=1; done < <(extract_json_array "train_patient_ids" "$split_json")
+  while IFS= read -r pid; do [[ -n "$pid" ]] && TEST_CASES["$pid"]=1; done < <(extract_json_array "test_patient_ids" "$split_json")
+
+  [[ "${#TRAIN_CASES[@]}" -gt 0 ]] || die "No train patients parsed from $split_json"
+  [[ "${#TEST_CASES[@]}" -gt 0 ]] || die "No test patients parsed from $split_json"
+
+  log "Building GT linked dataset"
+  log "  input_dir=$input_dir"
+  log "  split_json=$split_json"
+  log "  out_dir=$out_dir"
+  log "  train cases=${#TRAIN_CASES[@]}"
+  log "  test cases=${#TEST_CASES[@]}"
+
+  if [[ "$CLEAN_LINKED_DATA" == "1" ]]; then
+    log "Cleaning old linked DATA_DIR: $out_dir"
+    rm -rf "$out_dir"
+  fi
+
+  mkdir -p "$out_dir/trainA" "$out_dir/trainB" "$out_dir/testA" "$out_dir/testB"
+
+  local c_ts_train=0 c_ts_test=0 c_bs_train=0 c_bs_test=0 c_dx_train=0 c_dx_test=0 c_skip=0
+
+  for src in "$input_dir"/*; do
+    [[ -d "$src" ]] || continue
+    local name cid split
+    name="$(basename "$src")"
+    cid="$(extract_case_id "$name")"
+    [[ -n "$cid" ]] || { ((c_skip+=1)); continue; }
+
+    split=""
+    if [[ -n "${TRAIN_CASES[$cid]:-}" ]]; then split="train"
+    elif [[ -n "${TEST_CASES[$cid]:-}" ]]; then split="test"
+    else ((c_skip+=1)); continue
+    fi
+
+    # A domain = input side. For GT condition, use real TS + real BS.
+    if is_ts_like "$name"; then
+      link_tree "$src" "$out_dir/${split}A"
+      [[ "$split" == "train" ]] && ((c_ts_train+=1)) || ((c_ts_test+=1))
+    elif is_bs_like "$name"; then
+      link_tree "$src" "$out_dir/${split}A"
+      [[ "$split" == "train" ]] && ((c_bs_train+=1)) || ((c_bs_test+=1))
+    # B domain = target side. Use DX/FFPE.
+    elif is_dx_like "$name"; then
+      link_tree "$src" "$out_dir/${split}B"
+      [[ "$split" == "train" ]] && ((c_dx_train+=1)) || ((c_dx_test+=1))
+    fi
+  done
+
+  log "============================================================"
+  log "GT linked dataset summary"
+  log "============================================================"
+  log "GT TS slide folders train: $c_ts_train"
+  log "GT TS slide folders test : $c_ts_test"
+  log "GT BS slide folders train: $c_bs_train"
+  log "GT BS slide folders test : $c_bs_test"
+  log "DX slide folders train   : $c_dx_train"
+  log "DX slide folders test    : $c_dx_test"
+  log "Other skipped            : $c_skip"
+  log "trainA images: $(count_images "$out_dir/trainA")"
+  log "trainB images: $(count_images "$out_dir/trainB")"
+  log "testA images : $(count_images "$out_dir/testA")"
+  log "testB images : $(count_images "$out_dir/testB")"
+  log "direct trainA files should be 0: $(find "$out_dir/trainA" -maxdepth 1 -type f | wc -l)"
+  log "broken links: $(find "$out_dir" -xtype l | wc -l)"
+  log "top-level: $(find "$out_dir" -mindepth 1 -maxdepth 1 -printf "%f " | sort)"
+}
+
+assert_train_layout() {
+  local d="$1"
+
+  log "Checking train layout before 01_train.py"
+  for sub in trainA trainB testA testB; do
+    [[ -d "$d/$sub" ]] || die "Missing $d/$sub"
+  done
+
+  local n_trainA n_trainB n_testA n_testB
+  n_trainA="$(count_images "$d/trainA")"
+  n_trainB="$(count_images "$d/trainB")"
+  n_testA="$(count_images "$d/testA")"
+  n_testB="$(count_images "$d/testB")"
+
+  log "Image counts: trainA=$n_trainA trainB=$n_trainB testA=$n_testA testB=$n_testB"
+
+  [[ "$n_trainA" -gt 0 ]] || die "trainA has no images"
+  [[ "$n_trainB" -gt 0 ]] || die "trainB has no images"
+  [[ "$n_testA"  -gt 0 ]] || die "testA has no images"
+  [[ "$n_testB"  -gt 0 ]] || die "testB has no images"
+
+  # This catches the exact previous failure: DATA_DIR accidentally points to RAW_DIR.
+  if find "$d" -maxdepth 1 -type d -name 'TCGA-*' | grep -q .; then
+    die "DATA_DIR contains raw TCGA folders at top-level. DATA_DIR is wrong: $d"
+  fi
+}
+
+add_rag_aliases() {
+  local rag_cache="$1"
+  local linked_data="$2"
+
+  python - "$rag_cache" "$linked_data" <<'PY'
+import sys
+from pathlib import Path
+from collections import defaultdict
+import torch
+
+rag_cache = Path(sys.argv[1])
+linked_data = Path(sys.argv[2])
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
+
+def no_ext(s):
+    p = Path(str(s))
+    return str(p.with_suffix("")) if p.suffix else str(s)
+
+def add(mapping, key, idx, collisions):
+    if key is None:
+        return
+    key = str(key).replace("\\", "/")
+    if not key:
+        return
+    if key in mapping and mapping[key] != idx:
+        collisions[key].add(mapping[key])
+        collisions[key].add(idx)
+        return
+    mapping[key] = idx
+
+def update_lookup(path, domains):
+    obj = torch.load(path, map_location="cpu")
+    names = [str(x).replace("\\", "/") for x in obj["fs_filenames"]]
+    mapping = dict(obj.get("fs_name2idx", {n: i for i, n in enumerate(names)}))
+    collisions = defaultdict(set)
+
+    for i, n in enumerate(names):
+        add(mapping, n, i, collisions)
+        add(mapping, no_ext(n), i, collisions)
+        if n.startswith(("trainA/", "testA/")):
+            rel = "/".join(n.split("/")[1:])
+            add(mapping, rel, i, collisions)
+            add(mapping, no_ext(rel), i, collisions)
+
+    key_to_idx = {}
+    for i, n in enumerate(names):
+        key_to_idx[n] = i
+        key_to_idx[no_ext(n)] = i
+        if n.startswith(("trainA/", "testA/")):
+            rel = "/".join(n.split("/")[1:])
+            key_to_idx[rel] = i
+            key_to_idx[no_ext(rel)] = i
+
+    matched = 0
+    for dom in domains:
+        root = linked_data / dom
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in IMG_EXTS:
+                continue
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            candidates = [rel, no_ext(rel), f"{dom}/{rel}", no_ext(f"{dom}/{rel}")]
+            idx = None
+            for c in candidates:
+                if c in key_to_idx:
+                    idx = key_to_idx[c]
+                    break
+            if idx is None:
+                continue
+            matched += 1
+            add(mapping, str(p.resolve()), idx, collisions)
+            add(mapping, str(p.absolute()), idx, collisions)
+            add(mapping, str(p), idx, collisions)
+            add(mapping, no_ext(str(p.resolve())), idx, collisions)
+            add(mapping, no_ext(str(p.absolute())), idx, collisions)
+            add(mapping, no_ext(str(p)), idx, collisions)
+
+    obj["fs_name2idx"] = mapping
+    obj["fs_name2idx_alias_info"] = {
+        "linked_data": str(linked_data),
+        "linked_matched_files": matched,
+        "alias_n": len(mapping),
+        "collision_n": len(collisions),
+        "collision_examples": list(collisions.keys())[:20],
+    }
+    torch.save(obj, path)
+    print(f"Updated aliases: {path}")
+    print(f"  fs_filenames       : {len(names):,}")
+    print(f"  linked matched     : {matched:,}")
+    print(f"  fs_name2idx aliases: {len(mapping):,}")
+    print(f"  collisions skipped : {len(collisions):,}")
+
+for split, domains in [("train", ["trainA"]), ("test", ["testA"])]:
+    lookup = rag_cache / split / "rag_lookup.pt"
+    if lookup.exists():
+        update_lookup(lookup, domains)
+    else:
+        raise FileNotFoundError(f"Missing {lookup}")
+PY
+}
+
+log "============================================================"
+log "Step 1. Create KIRC grade RAG split/cache from RAW GT TS+BS+DX"
+log "============================================================"
+
+# Remove only this grade cache to avoid stale split/label mismatch.
+rm -rf "$RAG_CACHE"
+mkdir -p "$RAG_CACHE"
+
+python -u 01_precompute_rag.py \
+  --input-dir "$RAW_DIR" \
+  --label-file "$LABEL_FILE" \
+  --patient-col CASE_ID \
+  --label-col label \
+  --output-dir "$RAG_CACHE" \
+  --test-ratio 0.2 \
+  --seed 42 \
+  --k 5 \
+  --batch-size 128 \
+  --num-workers 4
+
+log "============================================================"
+log "Step 2. Build linked trainA/trainB/testA/testB dataset"
+log "============================================================"
+
+build_gt_links "$RAW_DIR" "$RAG_CACHE/split.json" "$DATA_DIR"
+
+log "============================================================"
+log "Step 3. Validate linked dataset layout"
+log "============================================================"
+
+assert_train_layout "$DATA_DIR"
+
+log "============================================================"
+log "Step 4. Add RAG aliases for linked dataset paths"
+log "============================================================"
+
+add_rag_aliases "$RAG_CACHE" "$DATA_DIR"
+
+log "============================================================"
+log "Step 5. Train GT TS+BS -> DX/FFPE with KIRC grade labels"
+log "============================================================"
+
+python -u 01_train.py \
+  --preset uni-full \
+  --data-path "$DATA_DIR" \
+  --rag-cache-dir "$RAG_CACHE" \
+  --label kirc_grade_gt_unifull \
+  --run-tag gt-ts-gt-bs-grade \
+  --out-root "$OUT_ROOT" \
+  --batch-size 4 \
+  --epochs 200 \
+  --steps-per-epoch 1000 \
+  --checkpoint-every 10 \
+  --no-pretrain
+
+log "✅ KIRC grade GT pipeline finished: $(date)"

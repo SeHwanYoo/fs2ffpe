@@ -1,0 +1,100 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+#PBS -N TRAIN_GT_ONLY
+#PBS -P gs_lkc_wilsongoh
+#PBS -q gpu_v100
+#PBS -l walltime=50:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -j oe
+# ---------------------------------------------------------------------------
+
+set -Eeo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+LOG="./progress_train_gt_only_${PBS_JOBID}.log"
+exec > >(tee -a "$LOG") 2>&1
+
+trap 'echo "❌ ERROR at line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+
+echo "============================================================"
+echo "🚀 GT train-only start: $(date)"
+echo "PWD: $(pwd)"
+echo "Node: $(hostname)"
+echo "GPU: ${CUDA_VISIBLE_DEVICES:-NONE}"
+echo "Log: $LOG"
+echo "============================================================"
+
+source ~/.bashrc
+module load anaconda2025/2025-gpu
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate sdxl_train_py312
+
+echo "Python: $(which python)"
+python --version
+
+# ============================================================
+# Paths: existing outputs from previous RAG/link pipeline
+# ============================================================
+DATA_DIR="/home/sehwan001/datasets/gt_ts_bs"
+RAG_CACHE="./rag/kirc_cache_gt"
+OUT_ROOT="./outputs/kirc_gt"
+
+LABEL="kirc_gt_unifull"
+RUN_TAG="gt-ts-gt-bs"
+
+echo "============================================================"
+echo "Checking required files/folders"
+echo "============================================================"
+
+ls -lh 01_train.py
+ls -ld "$DATA_DIR"
+ls -ld "$DATA_DIR/trainA" "$DATA_DIR/trainB"
+ls -ld "$RAG_CACHE"
+ls -lh "$RAG_CACHE/train/rag_lookup.pt"
+ls -lh "$RAG_CACHE/test/rag_lookup.pt"
+
+mkdir -p "$OUT_ROOT"
+
+echo "============================================================"
+echo "Sanity check: dataloader must see non-zero trainA/trainB"
+echo "============================================================"
+
+python - <<PY
+from uvcgan2.data.datasets.image_domain_hierarchy import ImageDomainHierarchy
+
+data_dir = "${DATA_DIR}"
+
+ds_a = ImageDomainHierarchy(data_dir, domain="A", split="train", transform=None)
+ds_b = ImageDomainHierarchy(data_dir, domain="B", split="train", transform=None)
+
+print("DATA_DIR:", data_dir)
+print("train A path:", ds_a._path)
+print("train B path:", ds_b._path)
+print("train A length:", len(ds_a))
+print("train B length:", len(ds_b))
+
+if len(ds_a) <= 0 or len(ds_b) <= 0:
+    raise SystemExit("❌ Dataset length is zero. Check image_domain_folder.py / image_domain_hierarchy.py recursive loader patch.")
+PY
+
+echo "============================================================"
+echo "Train GT: GT TS + GT BS -> DX/FFPE"
+echo "============================================================"
+
+python -u 01_train.py \
+  --preset uni-full \
+  --data-path "$DATA_DIR" \
+  --rag-cache-dir "$RAG_CACHE" \
+  --label "$LABEL" \
+  --run-tag "$RUN_TAG" \
+  --out-root "$OUT_ROOT" \
+  --batch-size 4 \
+  --epochs 200 \
+  --steps-per-epoch 1000 \
+  --checkpoint-every 10 \
+  --no-pretrain
+
+echo "============================================================"
+echo "✅ GT train-only finished: $(date)"
+echo "============================================================"

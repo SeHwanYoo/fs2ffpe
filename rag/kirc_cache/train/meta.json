@@ -1,0 +1,29 @@
+{
+  "created": "2026-06-06 23:03:28",
+  "split": "train",
+  "db_scope": "train",
+  "input_dir": "/home/sehwan001/datasets/patches/patches",
+  "gen_dir": null,
+  "query_mode": "TS+BS",
+  "gen_key_prefix": null,
+  "dx_source": "DX-classified records under input_dir",
+  "n_query": 182728,
+  "n_db": 87000,
+  "n_query_patients": 62,
+  "n_db_patients": 58,
+  "query_source_counts": {
+    "TS": 90727,
+    "BS": 92001
+  },
+  "db_source_counts": {
+    "DX": 87000
+  },
+  "label_counts_query_patients": {
+    "0": 27,
+    "1": 35
+  },
+  "k": 5,
+  "requested_k": 5,
+  "exclude_same_case": false,
+  "test_db_scope": "train"
+}
