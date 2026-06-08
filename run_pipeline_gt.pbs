@@ -14,7 +14,7 @@ cd "$PBS_O_WORKDIR"
 
 LOG="./progress_pipeline_gt_grade_${PBS_JOBID}.log"
 exec > >(tee -a "$LOG") 2>&1
-trap 'echo "❌ ERROR line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+trap 'ec=$?; echo "❌ ERROR line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $ec"; exit $ec' ERR
 
 log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 die(){ echo "❌ $*" >&2; exit 1; }
@@ -31,6 +31,81 @@ source ~/.bashrc
 module load anaconda2025/2025-gpu
 eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
 conda activate sdxl_train_py312
+
+# ============================================================
+# Load .env secrets into this PBS shell
+# ============================================================
+# A .env file is just a text file unless this job explicitly loads it.
+# Do not print token values to the log.
+ENV_FILE="${ENV_FILE:-$PBS_O_WORKDIR/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  log "Loading environment variables from: $ENV_FILE"
+  ENV_TMP="$(mktemp)"
+  tr -d '\r' < "$ENV_FILE" > "$ENV_TMP"
+  set -a
+  source "$ENV_TMP"
+  set +a
+  rm -f "$ENV_TMP"
+else
+  log "No .env found at: $ENV_FILE"
+fi
+
+# huggingface_hub officially reads HF_TOKEN. Map common .env names to HF_TOKEN.
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGINGFACE_HUB_TOKEN:-}" ]]; then
+  export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
+fi
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  export HF_TOKEN="$HUGGING_FACE_HUB_TOKEN"
+fi
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGINGFACE_TOKEN:-}" ]]; then
+  export HF_TOKEN="$HUGGINGFACE_TOKEN"
+fi
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-$HF_TOKEN}"
+  log "HF_TOKEN is available to this job. length=${#HF_TOKEN}"
+else
+  log "HF_TOKEN is NOT set in this job shell. UNI gated model access may fail."
+fi
+
+
+# ============================================================
+# Hugging Face / UNI access preflight
+# ============================================================
+# preset=uni-full loads MahmoodLab/UNI for UNIPerceptualLoss.
+# --no-pretrain does NOT disable this UNI perceptual model.
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+
+log "Checking Hugging Face access for MahmoodLab/UNI"
+python - <<'ENDHF'
+from huggingface_hub import HfApi
+
+repo = "MahmoodLab/UNI"
+try:
+    who = HfApi().whoami()
+    user = who.get("name") or who.get("fullname") or "UNKNOWN"
+    print(f"HF login OK: {user}")
+except Exception as e:
+    raise SystemExit(
+        "HF login check failed. Run on the login node:\n"
+        "  conda activate sdxl_train_py312\n"
+        "  hf auth login\n"
+        "  hf auth whoami\n"
+        "Also make sure your HF account has access to MahmoodLab/UNI.\n"
+        f"Original error: {type(e).__name__}: {e}"
+    )
+
+try:
+    HfApi().model_info(repo)
+    print(f"HF gated model access OK: {repo}")
+except Exception as e:
+    raise SystemExit(
+        f"Cannot access {repo}. Open the model page in a browser, request/accept access, "
+        "then rerun hf auth login on the server.\n"
+        f"Original error: {type(e).__name__}: {e}"
+    )
+ENDHF
+
 
 # ============================================================
 # IMPORTANT PATHS

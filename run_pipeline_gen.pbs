@@ -14,7 +14,7 @@ cd "$PBS_O_WORKDIR"
 
 LOG="./progress_pipeline_gen_grade_${PBS_JOBID}.log"
 exec > >(tee -a "$LOG") 2>&1
-trap 'echo "❌ ERROR line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $?"' ERR
+trap 'ec=$?; echo "❌ ERROR line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $ec"; exit $ec' ERR
 
 log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 die(){ echo "❌ $*" >&2; exit 1; }
@@ -31,6 +31,81 @@ source ~/.bashrc
 module load anaconda2025/2025-gpu
 eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
 conda activate sdxl_train_py312
+
+# ============================================================
+# Load .env secrets into this PBS shell
+# ============================================================
+# A .env file is just a text file unless this job explicitly loads it.
+# Do not print token values to the log.
+ENV_FILE="${ENV_FILE:-$PBS_O_WORKDIR/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  log "Loading environment variables from: $ENV_FILE"
+  ENV_TMP="$(mktemp)"
+  tr -d '\r' < "$ENV_FILE" > "$ENV_TMP"
+  set -a
+  source "$ENV_TMP"
+  set +a
+  rm -f "$ENV_TMP"
+else
+  log "No .env found at: $ENV_FILE"
+fi
+
+# huggingface_hub officially reads HF_TOKEN. Map common .env names to HF_TOKEN.
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGINGFACE_HUB_TOKEN:-}" ]]; then
+  export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
+fi
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  export HF_TOKEN="$HUGGING_FACE_HUB_TOKEN"
+fi
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGINGFACE_TOKEN:-}" ]]; then
+  export HF_TOKEN="$HUGGINGFACE_TOKEN"
+fi
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-$HF_TOKEN}"
+  log "HF_TOKEN is available to this job. length=${#HF_TOKEN}"
+else
+  log "HF_TOKEN is NOT set in this job shell. UNI gated model access may fail."
+fi
+
+
+# ============================================================
+# Hugging Face / UNI access preflight
+# ============================================================
+# preset=uni-full loads MahmoodLab/UNI for UNIPerceptualLoss.
+# --no-pretrain does NOT disable this UNI perceptual model.
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+
+log "Checking Hugging Face access for MahmoodLab/UNI"
+python - <<'ENDHF'
+from huggingface_hub import HfApi
+
+repo = "MahmoodLab/UNI"
+try:
+    who = HfApi().whoami()
+    user = who.get("name") or who.get("fullname") or "UNKNOWN"
+    print(f"HF login OK: {user}")
+except Exception as e:
+    raise SystemExit(
+        "HF login check failed. Run on the login node:\n"
+        "  conda activate sdxl_train_py312\n"
+        "  hf auth login\n"
+        "  hf auth whoami\n"
+        "Also make sure your HF account has access to MahmoodLab/UNI.\n"
+        f"Original error: {type(e).__name__}: {e}"
+    )
+
+try:
+    HfApi().model_info(repo)
+    print(f"HF gated model access OK: {repo}")
+except Exception as e:
+    raise SystemExit(
+        f"Cannot access {repo}. Open the model page in a browser, request/accept access, "
+        "then rerun hf auth login on the server.\n"
+        f"Original error: {type(e).__name__}: {e}"
+    )
+ENDHF
+
 
 # ============================================================
 # IMPORTANT PATHS
@@ -419,6 +494,135 @@ log "============================================================"
 # Remove only this generated-grade cache to avoid stale split/label mismatch.
 rm -rf "$RAG_CACHE"
 mkdir -p "$RAG_CACHE"
+
+log "============================================================"
+log "Step 1a. Strict split/coverage precheck and manifest writing"
+log "============================================================"
+
+python - "$RAW_DIR" "$GEN_DIR" "$GT_SPLIT_JSON" "$RAG_CACHE/manifests" <<'PYCHECK'
+import csv
+import json
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+raw_dir = Path(sys.argv[1])
+gen_dir = Path(sys.argv[2])
+split_json = Path(sys.argv[3])
+manifest_dir = Path(sys.argv[4])
+manifest_dir.mkdir(parents=True, exist_ok=True)
+
+case_re = re.compile(r"(TCGA-[A-Z0-9]{2}-[A-Z0-9]{4})", re.I)
+ts_re = re.compile(r"(^|[-_/\\])TS[0-9]*($|[-_.\\/])", re.I)
+bs_re = re.compile(r"(^|[-_/\\])BS[0-9]*($|[-_.\\/])", re.I)
+dx_re = re.compile(r"(^|[-_/\\])DX[0-9]*($|[-_.\\/])", re.I)
+
+def case_id(name: str):
+    m = case_re.search(name)
+    return m.group(1).upper() if m else None
+
+def scan(root: Path, kind: str):
+    out = defaultdict(list)
+    for p in sorted(root.iterdir()):
+        if not p.is_dir():
+            continue
+        n = p.name
+        cid = case_id(n)
+        if not cid:
+            continue
+        if kind == "ts" and not ts_re.search(n):
+            continue
+        if kind == "bs" and not bs_re.search(n):
+            continue
+        if kind == "dx" and not dx_re.search(n):
+            continue
+        out[cid].append(n)
+    return out
+
+def write_list(path: Path, rows):
+    path.write_text("\n".join(map(str, rows)) + ("\n" if rows else ""))
+
+with split_json.open() as f:
+    split = json.load(f)
+
+train_ids = [x.upper() for x in split.get("train_patient_ids", [])]
+test_ids = [x.upper() for x in split.get("test_patient_ids", [])]
+all_ids = train_ids + test_ids
+split_of = {cid: "train" for cid in train_ids}
+split_of.update({cid: "test" for cid in test_ids})
+
+raw_ts = scan(raw_dir, "ts")
+raw_bs = scan(raw_dir, "bs")
+raw_dx = scan(raw_dir, "dx")
+gen_ts = scan(gen_dir, "ts")
+
+write_list(manifest_dir / "split_train_patients.txt", train_ids)
+write_list(manifest_dir / "split_test_patients.txt", test_ids)
+
+for split_name, ids in [("train", train_ids), ("test", test_ids)]:
+    write_list(manifest_dir / f"raw_ts_{split_name}_folders.txt", [n for cid in ids for n in raw_ts.get(cid, [])])
+    write_list(manifest_dir / f"real_bs_{split_name}_folders_ignored.txt", [n for cid in ids for n in raw_bs.get(cid, [])])
+    write_list(manifest_dir / f"gen_bs_like_{split_name}_folders.txt", [n for cid in ids for n in gen_ts.get(cid, [])])
+    write_list(manifest_dir / f"dx_{split_name}_folders.txt", [n for cid in ids for n in raw_dx.get(cid, [])])
+
+missing_raw_ts_cases = [cid for cid in all_ids if not raw_ts.get(cid)]
+missing_dx_cases = [cid for cid in all_ids if not raw_dx.get(cid)]
+missing_gen_cases = [cid for cid in all_ids if not gen_ts.get(cid)]
+
+expected_ts_names = {n for cid in all_ids for n in raw_ts.get(cid, [])}
+gen_names = {n for cid in all_ids for n in gen_ts.get(cid, [])}
+missing_gen_exact_ts_name = sorted(expected_ts_names - gen_names)
+extra_gen_names_in_split = sorted(gen_names - expected_ts_names)
+
+write_list(manifest_dir / "missing_raw_ts_cases.txt", missing_raw_ts_cases)
+write_list(manifest_dir / "missing_dx_cases.txt", missing_dx_cases)
+write_list(manifest_dir / "missing_gen_bs_like_cases.txt", missing_gen_cases)
+write_list(manifest_dir / "missing_gen_exact_ts_folder_names.txt", missing_gen_exact_ts_name)
+write_list(manifest_dir / "extra_gen_folder_names_not_matching_raw_ts.txt", extra_gen_names_in_split)
+
+with (manifest_dir / "case_coverage.csv").open("w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["case_id", "split", "raw_ts_n", "real_bs_ignored_n", "gen_bs_like_n", "dx_n", "raw_ts_folders", "gen_bs_like_folders", "dx_folders"])
+    for cid in all_ids:
+        w.writerow([
+            cid,
+            split_of[cid],
+            len(raw_ts.get(cid, [])),
+            len(raw_bs.get(cid, [])),
+            len(gen_ts.get(cid, [])),
+            len(raw_dx.get(cid, [])),
+            ";".join(raw_ts.get(cid, [])),
+            ";".join(gen_ts.get(cid, [])),
+            ";".join(raw_dx.get(cid, [])),
+        ])
+
+print("Precheck manifest dir:", manifest_dir)
+print("Split patients       :", len(train_ids), "train /", len(test_ids), "test")
+print("Raw TS folders       :", sum(len(raw_ts.get(cid, [])) for cid in train_ids), "train /", sum(len(raw_ts.get(cid, [])) for cid in test_ids), "test")
+print("Real BS ignored      :", sum(len(raw_bs.get(cid, [])) for cid in train_ids), "train /", sum(len(raw_bs.get(cid, [])) for cid in test_ids), "test")
+print("GEN BS-like folders  :", sum(len(gen_ts.get(cid, [])) for cid in train_ids), "train /", sum(len(gen_ts.get(cid, [])) for cid in test_ids), "test")
+print("DX folders           :", sum(len(raw_dx.get(cid, [])) for cid in train_ids), "train /", sum(len(raw_dx.get(cid, [])) for cid in test_ids), "test")
+print("Missing raw TS cases :", len(missing_raw_ts_cases))
+print("Missing DX cases     :", len(missing_dx_cases))
+print("Missing GEN cases    :", len(missing_gen_cases))
+print("Missing GEN exact TS folder names:", len(missing_gen_exact_ts_name))
+print("Extra GEN names not matching raw TS:", len(extra_gen_names_in_split))
+
+failures = []
+if missing_raw_ts_cases:
+    failures.append(f"Missing raw TS cases: {missing_raw_ts_cases[:20]}")
+if missing_dx_cases:
+    failures.append(f"Missing DX cases: {missing_dx_cases[:20]}")
+if missing_gen_cases:
+    failures.append(f"Missing GEN BS-like cases: {missing_gen_cases[:20]}")
+if missing_gen_exact_ts_name:
+    failures.append(f"Missing GEN folders for raw TS folder names: {missing_gen_exact_ts_name[:20]}")
+
+if failures:
+    print("\n".join(failures))
+    raise SystemExit("Strict GEN precheck failed. See manifest files above.")
+PYCHECK
 
 python -u 01_precompute_rag.py \
   --input-dir "$RAW_DIR" \
