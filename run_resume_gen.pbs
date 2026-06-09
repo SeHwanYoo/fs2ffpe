@@ -1,0 +1,403 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+#PBS -N GEN_GRADE_RESUME2
+#PBS -P gs_lkc_wilsongoh
+#PBS -q gpu_v100
+#PBS -l walltime=50:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -j oe
+# ---------------------------------------------------------------------------
+
+set -Eeo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+LOG="./progress_pipeline_gen_grade_resume2_${PBS_JOBID}.log"
+exec > >(tee -a "$LOG") 2>&1
+trap 'ec=$?; echo "❌ ERROR line $LINENO"; echo "Command: $BASH_COMMAND"; echo "Exit code: $ec"; exit $ec' ERR
+
+log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+die(){ echo "❌ $*" >&2; exit 1; }
+
+log "============================================================"
+log "🚀 Resume KIRC GRADE GEN pipeline after alias collision fix"
+log "PWD: $(pwd)"
+log "Node: $(hostname)"
+log "GPU: ${CUDA_VISIBLE_DEVICES:-NONE}"
+log "Log: $LOG"
+log "============================================================"
+
+source ~/.bashrc
+module load anaconda2025/2025-gpu
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate sdxl_train_py312
+
+# Load .env secrets into this PBS shell, without printing values.
+ENV_FILE="${ENV_FILE:-$PBS_O_WORKDIR/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  log "Loading environment variables from: $ENV_FILE"
+  ENV_TMP="$(mktemp)"
+  tr -d '\r' < "$ENV_FILE" > "$ENV_TMP"
+  set -a
+  source "$ENV_TMP"
+  set +a
+  rm -f "$ENV_TMP"
+else
+  log "No .env found at: $ENV_FILE"
+fi
+
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGINGFACE_HUB_TOKEN:-}" ]]; then export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"; fi
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then export HF_TOKEN="$HUGGING_FACE_HUB_TOKEN"; fi
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGINGFACE_TOKEN:-}" ]]; then export HF_TOKEN="$HUGGINGFACE_TOKEN"; fi
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-$HF_TOKEN}"
+  log "HF_TOKEN is available to this job. length=${#HF_TOKEN}"
+else
+  log "HF_TOKEN is NOT set in this job shell. UNI gated model access may fail."
+fi
+
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+
+RAW_DIR="/home/sehwan001/datasets/patches/patches"
+GEN_DIR="/home/sehwan001/datasets/gen_bs"
+LABEL_FILE="./rag/kirc_cache_grade_common/manifests/kirc_grade_labels_common_ts_bs_dx_gen.csv"
+DATA_DIR="/home/sehwan001/datasets/kirc_grade_common_gt_ts_gen_bs"
+RAG_CACHE="./rag/kirc_cache_grade_common_gen"
+OUT_ROOT="./outputs/kirc_grade_common_gen"
+SPLIT_JSON="$RAG_CACHE/split.json"
+
+log "RAW_DIR    : $RAW_DIR"
+log "GEN_DIR    : $GEN_DIR"
+log "LABEL_FILE : $LABEL_FILE"
+log "DATA_DIR   : $DATA_DIR"
+log "RAG_CACHE  : $RAG_CACHE"
+log "OUT_ROOT   : $OUT_ROOT"
+log "SPLIT_JSON : $SPLIT_JSON"
+
+[[ -d "$RAW_DIR" ]] || die "RAW_DIR not found: $RAW_DIR"
+[[ -d "$GEN_DIR" ]] || die "GEN_DIR not found: $GEN_DIR"
+[[ -f "$LABEL_FILE" ]] || die "LABEL_FILE not found: $LABEL_FILE"
+[[ -d "$DATA_DIR" ]] || die "Existing linked DATA_DIR not found: $DATA_DIR. Use the full v2 PBS instead."
+[[ -f "$SPLIT_JSON" ]] || die "Existing GEN split not found: $SPLIT_JSON. Use the full v2 PBS instead."
+[[ -f "$RAG_CACHE/train/rag_lookup.pt" ]] || die "Existing train rag_lookup.pt not found. Use the full v2 PBS instead."
+[[ -f "$RAG_CACHE/test/rag_lookup.pt" ]] || die "Existing test rag_lookup.pt not found. Use the full v2 PBS instead."
+mkdir -p "$OUT_ROOT"
+
+log "============================================================"
+log "Step R1. Validate existing linked dataset layout"
+log "============================================================"
+
+python - "$DATA_DIR" <<'PYLAYOUT'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+IMG_EXTS = {'.png','.jpg','.jpeg','.tif','.tiff','.webp'}
+req = ['trainA','trainB','testA','testB']
+missing = [x for x in req if not (root/x).is_dir()]
+if missing:
+    raise SystemExit(f"Missing required folders: {missing}; contents={sorted(p.name for p in root.iterdir()) if root.exists() else 'NO_ROOT'}")
+def count(d):
+    return sum(1 for p in (root/d).rglob('*') if p.is_file() and p.suffix.lower() in IMG_EXTS)
+def count_gen(d):
+    return sum(1 for p in (root/d/'BS').rglob('*') if p.is_file() and p.suffix.lower() in IMG_EXTS)
+print('Image counts:', 'trainA=', count('trainA'), 'trainB=', count('trainB'), 'testA=', count('testA'), 'testB=', count('testB'), 'gen_train=', count_gen('trainA'), 'gen_test=', count_gen('testA'))
+for d in req:
+    c = count(d)
+    if c <= 0:
+        raise SystemExit(f"No images in {d}")
+if count_gen('trainA') <= 0 or count_gen('testA') <= 0:
+    raise SystemExit('No generated BS-like images found under trainA/BS or testA/BS')
+broken = []
+for p in root.rglob('*'):
+    if p.is_symlink() and not p.exists():
+        broken.append(str(p))
+print('broken links:', len(broken))
+if broken:
+    raise SystemExit(f"Broken links examples: {broken[:10]}")
+PYLAYOUT
+
+log "============================================================"
+log "Step R2. Verify no overwrite/clobber between real TS and generated BS-like"
+log "============================================================"
+
+python - "$RAW_DIR" "$GEN_DIR" "$SPLIT_JSON" "$DATA_DIR" <<'PYVERIFY'
+import json, os, re, sys
+from collections import defaultdict
+from pathlib import Path
+raw_dir = Path(sys.argv[1]); gen_dir = Path(sys.argv[2]); split_json = Path(sys.argv[3]); linked_data = Path(sys.argv[4])
+IMG_EXTS = {'.png','.jpg','.jpeg','.tif','.tiff','.webp'}
+case_re = re.compile(r'(TCGA-[A-Z0-9]{2}-[A-Z0-9]{4})', re.I)
+ts_re = re.compile(r'(^|[-_/\\])TS[0-9]*($|[-_.\\/])', re.I)
+bs_re = re.compile(r'(^|[-_/\\])BS[0-9]*($|[-_.\\/])', re.I)
+def case_id(name):
+    m = case_re.search(name)
+    return m.group(1).upper() if m else None
+def scan_ts(root):
+    out = defaultdict(list)
+    for p in sorted(root.iterdir()):
+        if p.is_dir() and ts_re.search(p.name):
+            cid = case_id(p.name)
+            if cid: out[cid].append(p.name)
+    return out
+def image_rel_set(root):
+    if not root.exists(): return set()
+    return {str(p.relative_to(root)).replace('\\','/') for p in root.rglob('*') if p.is_file() and p.suffix.lower() in IMG_EXTS}
+def same_file_examples(a,b,rels,limit=10):
+    bad=[]
+    for r in sorted(rels):
+        pa,pb=a/r,b/r
+        if pa.exists() and pb.exists():
+            try:
+                if os.path.samefile(pa,pb):
+                    bad.append(r)
+                    if len(bad)>=limit: break
+            except FileNotFoundError:
+                pass
+    return bad
+with split_json.open() as f: split = json.load(f)
+train_ids=[x.upper() for x in split.get('train_patient_ids', [])]; test_ids=[x.upper() for x in split.get('test_patient_ids', [])]
+all_ids=train_ids+test_ids; split_of={cid:'train' for cid in train_ids}; split_of.update({cid:'test' for cid in test_ids})
+raw_ts=scan_ts(raw_dir); gen_ts=scan_ts(gen_dir)
+failures=[]; checked_pairs=0; same_name_pairs=0; shared_rel_file_pairs=0
+for cid in all_ids:
+    sp=split_of[cid]
+    for name in raw_ts.get(cid, []):
+        if name not in set(gen_ts.get(cid, [])):
+            failures.append(f'missing generated TS-named folder for {name}'); continue
+        real_link=linked_data/f'{sp}A'/name; gen_link=linked_data/f'{sp}A'/'BS'/name
+        if not real_link.exists(): failures.append(f'missing real TS linked folder: {real_link}'); continue
+        if not gen_link.exists(): failures.append(f'missing generated BS-like linked folder: {gen_link}'); continue
+        checked_pairs += 1; same_name_pairs += 1
+        common = image_rel_set(real_link) & image_rel_set(gen_link)
+        if common:
+            shared_rel_file_pairs += 1
+            bad_samefiles = same_file_examples(real_link, gen_link, common)
+            if bad_samefiles:
+                failures.append(f'real TS and generated BS-like share same inode for {name}: {bad_samefiles[:5]}')
+for sp in ['train','test']:
+    bs_root = linked_data / f'{sp}A' / 'BS'
+    if not bs_root.exists(): failures.append(f'missing generated BS container: {bs_root}')
+    # IMPORTANT: top-level directory literally named BS is the intended generated container, not leakage.
+    leaked = [p.name for p in (linked_data/f'{sp}A').iterdir() if p.is_dir() and p.name.upper() != 'BS' and case_id(p.name) is not None and bs_re.search(p.name)]
+    if leaked: failures.append(f'real BS-like top-level leakage in {sp}A: {leaked[:20]}')
+print('No-clobber verification')
+print('  checked real TS / generated BS-like folder pairs:', checked_pairs)
+print('  same basename pairs intentionally separated     :', same_name_pairs)
+print('  pairs with same internal image names             :', shared_rel_file_pairs)
+print('  generated location pattern                       : trainA/BS/<TS-folder>, testA/BS/<TS-folder>')
+if failures:
+    print('\n'.join(failures[:50])); raise SystemExit('No-clobber verification failed')
+PYVERIFY
+
+log "============================================================"
+log "Step R3. Add RAG aliases for linked dataset paths"
+log "============================================================"
+
+python - "$RAG_CACHE" "$DATA_DIR" <<'PYALIASES'
+import sys
+from pathlib import Path
+import torch
+
+rag_cache = Path(sys.argv[1])
+linked_data = Path(sys.argv[2])
+IMG_EXTS = {'.png','.jpg','.jpeg','.tif','.tiff','.webp'}
+
+def norm(s):
+    return str(s).replace('\\', '/')
+
+def no_ext(s):
+    s = norm(s)
+    last = s.split('/')[-1]
+    return s.rsplit('.', 1)[0] if '.' in last else s
+
+def add(pending, key, idx):
+    key = norm(key)
+    if key:
+        pending.setdefault(key, set()).add(int(idx))
+
+def finalize_pending(pending):
+    mapping = {}
+    ambiguous = {}
+    for k, idxs in pending.items():
+        if len(idxs) == 1:
+            mapping[k] = next(iter(idxs))
+        else:
+            ambiguous[k] = sorted(idxs)
+    return mapping, ambiguous
+
+def update_lookup(path, domains):
+    obj = torch.load(path, map_location='cpu')
+    names = [norm(x) for x in obj.get('fs_filenames', [])]
+
+    # Build exact/relative lookup first. These keys are unique because fs_filenames must be unique.
+    exact_key_to_idx = {}
+    exact_dups = {}
+    def add_exact(k, idx):
+        k = norm(k)
+        old = exact_key_to_idx.get(k)
+        if old is None:
+            exact_key_to_idx[k] = idx
+        elif old != idx:
+            exact_dups.setdefault(k, set()).update([old, idx])
+
+    pending = {}
+    for i, n in enumerate(names):
+        # Full names and relative names are safe aliases.
+        add(pending, n, i)
+        add(pending, no_ext(n), i)
+        add_exact(n, i)
+        add_exact(no_ext(n), i)
+
+        if n.startswith(('trainA/', 'testA/')):
+            rel = '/'.join(n.split('/')[1:])
+            add(pending, rel, i)
+            add(pending, no_ext(rel), i)
+            add_exact(rel, i)
+            add_exact(no_ext(rel), i)
+
+        # Basename aliases are useful for old code, but in this GEN experiment
+        # real TS and generated BS-like intentionally share patch basenames.
+        # We add them to pending and remove them later if ambiguous.
+        base = Path(n).name
+        add(pending, base, i)
+        add(pending, no_ext(base), i)
+
+    matched = 0
+    unmatched_examples = []
+    for dom in domains:
+        root = linked_data / dom
+        if not root.exists():
+            continue
+        for p in root.rglob('*'):
+            if not p.is_file() or p.suffix.lower() not in IMG_EXTS:
+                continue
+            rel = norm(p.relative_to(root))
+            dom_rel = f'{dom}/{rel}'
+            idx = None
+            for c in [dom_rel, no_ext(dom_rel), rel, no_ext(rel)]:
+                if c in exact_key_to_idx:
+                    idx = exact_key_to_idx[c]
+                    break
+            if idx is None:
+                if len(unmatched_examples) < 20:
+                    unmatched_examples.append(dom_rel)
+                continue
+            matched += 1
+            # Absolute/symlink path aliases are safe because the real and generated folders differ.
+            for k in [str(p.resolve()), str(p.absolute()), str(p), no_ext(str(p.resolve())), no_ext(str(p.absolute())), no_ext(str(p))]:
+                add(pending, k, idx)
+
+    mapping, ambiguous = finalize_pending(pending)
+    ambiguous_with_slash = [k for k in ambiguous if '/' in k]
+    ambiguous_without_slash = [k for k in ambiguous if '/' not in k]
+
+    obj['fs_name2idx'] = mapping
+    obj['fs_name2idx_alias_info'] = {
+        'linked_data': str(linked_data),
+        'linked_matched_files': matched,
+        'alias_n': len(mapping),
+        'ambiguous_alias_removed_n': len(ambiguous),
+        'ambiguous_alias_without_slash_n': len(ambiguous_without_slash),
+        'ambiguous_alias_with_slash_n': len(ambiguous_with_slash),
+        'ambiguous_alias_examples': list(ambiguous.keys())[:20],
+        'unmatched_linked_files_n': len(unmatched_examples),
+        'unmatched_linked_examples': unmatched_examples,
+        'exact_duplicate_alias_n': len(exact_dups),
+        'exact_duplicate_examples': list(exact_dups.keys())[:20],
+    }
+    torch.save(obj, path)
+
+    print(f'Updated aliases safely: {path}')
+    print(f'  fs_filenames                  : {len(names):,}')
+    print(f'  linked matched                : {matched:,}')
+    print(f'  fs_name2idx aliases kept      : {len(mapping):,}')
+    print(f'  ambiguous aliases removed     : {len(ambiguous):,}')
+    print(f'    without slash, expected     : {len(ambiguous_without_slash):,}')
+    print(f'    with slash, should be 0     : {len(ambiguous_with_slash):,}')
+    if unmatched_examples:
+        print(f'  unmatched linked examples     : {unmatched_examples[:10]}')
+
+for split, domains in [('train', ['trainA']), ('test', ['testA'])]:
+    lookup = rag_cache / split / 'rag_lookup.pt'
+    if not lookup.exists():
+        raise FileNotFoundError(f'Missing {lookup}')
+    update_lookup(lookup, domains)
+PYALIASES
+
+log "============================================================"
+log "Step R4. Validate RAG lookup aliases and generated entries"
+log "============================================================"
+
+python - "$RAG_CACHE" <<'PYRAGCHECK'
+import sys
+from collections import Counter
+from pathlib import Path
+import torch
+
+rag_cache = Path(sys.argv[1])
+failures = []
+for split in ['train', 'test']:
+    path = rag_cache / split / 'rag_lookup.pt'
+    if not path.exists():
+        failures.append(f'missing lookup: {path}')
+        continue
+    obj = torch.load(path, map_location='cpu')
+    names = [str(x).replace('\\', '/') for x in obj.get('fs_filenames', [])]
+    dup = [k for k, v in Counter(names).items() if v > 1]
+    info = obj.get('fs_name2idx_alias_info', {})
+    gen_like = sum(('/BS/' in n) or n.startswith('BS/') or n.startswith(f'{split}A/BS/') for n in names)
+    linked_matched = int(info.get('linked_matched_files', -1)) if str(info.get('linked_matched_files', 'NA')).isdigit() else info.get('linked_matched_files', 'NA')
+    ambiguous_removed = int(info.get('ambiguous_alias_removed_n', 0) or 0)
+    ambiguous_with_slash = int(info.get('ambiguous_alias_with_slash_n', 0) or 0)
+    exact_dup_alias = int(info.get('exact_duplicate_alias_n', 0) or 0)
+    unmatched_n = int(info.get('unmatched_linked_files_n', 0) or 0)
+
+    print(f'RAG lookup integrity [{split}]')
+    print(f'  fs_filenames                  : {len(names):,}')
+    print(f'  duplicate fs_filenames        : {len(dup):,}')
+    print(f'  generated-like entries        : {gen_like:,}')
+    print(f'  linked matched files          : {linked_matched}')
+    print(f'  ambiguous aliases removed     : {ambiguous_removed:,}')
+    print(f'  ambiguous aliases with slash  : {ambiguous_with_slash:,}')
+    print(f'  exact duplicate aliases       : {exact_dup_alias:,}')
+    print(f'  unmatched linked files        : {unmatched_n:,}')
+
+    if dup:
+        failures.append(f'duplicate fs_filenames in {path}: {dup[:10]}')
+    if gen_like == 0:
+        failures.append(f'no generated-like BS entries detected in {path}')
+    if linked_matched != len(names):
+        failures.append(f'linked_matched_files != fs_filenames in {path}: {linked_matched} vs {len(names)}')
+    if ambiguous_with_slash:
+        failures.append(f'path-level ambiguous aliases found in {path}: {info.get("ambiguous_alias_examples", [])[:10]}')
+    if exact_dup_alias:
+        failures.append(f'exact duplicate aliases found in {path}: {info.get("exact_duplicate_examples", [])[:10]}')
+    if unmatched_n:
+        failures.append(f'unmatched linked files found in {path}: {info.get("unmatched_linked_examples", [])[:10]}')
+
+if failures:
+    print('\n'.join(map(str, failures[:50])))
+    raise SystemExit('RAG lookup integrity check failed')
+else:
+    print('RAG lookup integrity check passed. Basename-only ambiguities were removed, not treated as fatal.')
+PYRAGCHECK
+
+log "============================================================"
+log "Step R5. Train real TS + generated BS-like -> DX/FFPE with KIRC grade labels"
+log "============================================================"
+
+python -u 01_train.py \
+  --preset uni-full \
+  --data-path "$DATA_DIR" \
+  --rag-cache-dir "$RAG_CACHE" \
+  --label kirc_grade_common_gen_unifull \
+  --run-tag common-gt-ts-gen-bs-grade \
+  --out-root "$OUT_ROOT" \
+  --batch-size 4 \
+  --epochs 200 \
+  --steps-per-epoch 1000 \
+  --checkpoint-every 10 \
+  --no-pretrain
+
+log "✅ RESUMED COMMON KIRC grade GEN pipeline finished: $(date)"

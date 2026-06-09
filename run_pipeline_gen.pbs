@@ -594,7 +594,16 @@ for sp in ["train", "test"]:
     bs_root = linked_data / f"{sp}A" / "BS"
     if not bs_root.exists():
         failures.append(f"missing generated BS container: {bs_root}")
-    leaked = [p.name for p in (linked_data / f"{sp}A").iterdir() if p.is_dir() and re.search(r"(^|[-_/\\])BS[0-9]*($|[-_.\\/])", p.name, re.I)]
+    # The literal container directory named "BS" is intentional:
+    #   trainA/BS/<TS-folder> and testA/BS/<TS-folder> hold generated BS-like images.
+    # Only TCGA-named BS folders directly under trainA/testA are leakage.
+    leaked = [
+        p.name for p in (linked_data / f"{sp}A").iterdir()
+        if p.is_dir()
+        and p.name.upper() != "BS"
+        and case_id(p.name) is not None
+        and re.search(r"(^|[-_/\\])BS[0-9]*($|[-_.\\/])", p.name, re.I)
+    ]
     if leaked:
         failures.append(f"real BS-like top-level leakage in {sp}A: {leaked[:20]}")
 
