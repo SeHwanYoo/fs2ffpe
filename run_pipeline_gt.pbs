@@ -113,16 +113,20 @@ ENDHF
 # Raw folders must contain TCGA-...-TS1 / TCGA-...-BS1 / TCGA-...-DX1 folders.
 RAW_DIR="/home/sehwan001/datasets/patches/patches"
 
+# Generated BS-like folders. Used here only to define the common fair-comparison split.
+GEN_DIR="/home/sehwan001/datasets/gen_bs"
+
 # This is the correct label file for KIRC grade binary classification.
 LABEL_FILE="/home/sehwan001/projects/make_dataset/kirc/kirc_grade_labels_binary.csv"
 
 # Do NOT train directly on RAW_DIR. 01_train.py expects trainA/trainB/testA/testB.
 LINK_ROOT="/home/sehwan001/datasets"
-DATA_DIR="$LINK_ROOT/kirc_grade_gt_ts_bs"
+DATA_DIR="$LINK_ROOT/kirc_grade_common_gt_ts_bs"
 
 # Keep this separate from old PBRM1 / ambiguous caches.
-RAG_CACHE="./rag/kirc_cache_grade"
-OUT_ROOT="./outputs/kirc_grade_gt"
+RAG_CACHE="./rag/kirc_cache_grade_common"
+OUT_ROOT="./outputs/kirc_grade_common_gt"
+FILTERED_LABEL_FILE="$RAG_CACHE/manifests/kirc_grade_labels_common_ts_bs_dx_gen.csv"
 
 # 1 = rebuild linked trainA/trainB/testA/testB every run.
 # This only removes hardlinks/symlinks under DATA_DIR, not RAW_DIR.
@@ -131,12 +135,15 @@ CLEAN_LINKED_DATA=1
 mkdir -p "$LINK_ROOT" "$OUT_ROOT"
 
 log "RAW_DIR    : $RAW_DIR"
+log "GEN_DIR    : $GEN_DIR"
 log "LABEL_FILE : $LABEL_FILE"
+log "FILTERED_LABEL_FILE : $FILTERED_LABEL_FILE"
 log "DATA_DIR   : $DATA_DIR"
 log "RAG_CACHE  : $RAG_CACHE"
 log "OUT_ROOT   : $OUT_ROOT"
 
 [[ -d "$RAW_DIR" ]] || die "RAW_DIR not found: $RAW_DIR"
+[[ -d "$GEN_DIR" ]] || die "GEN_DIR not found: $GEN_DIR"
 [[ -f "$LABEL_FILE" ]] || die "LABEL_FILE not found: $LABEL_FILE"
 
 extract_case_id() {
@@ -406,17 +413,123 @@ for split, domains in [("train", ["trainA"]), ("test", ["testA"])]:
 PY
 }
 
+
+make_common_filtered_labels() {
+  local raw_dir="$1"
+  local gen_dir="$2"
+  local label_file="$3"
+  local out_csv="$4"
+  local manifest_dir
+  manifest_dir="$(dirname "$out_csv")"
+  mkdir -p "$manifest_dir"
+
+  python - "$raw_dir" "$gen_dir" "$label_file" "$out_csv" "$manifest_dir" <<'PYFILTER'
+import csv, re, sys
+from collections import defaultdict
+from pathlib import Path
+
+raw_dir = Path(sys.argv[1])
+gen_dir = Path(sys.argv[2])
+label_file = Path(sys.argv[3])
+out_csv = Path(sys.argv[4])
+manifest_dir = Path(sys.argv[5])
+manifest_dir.mkdir(parents=True, exist_ok=True)
+
+case_re = re.compile(r"(TCGA-[A-Z0-9]{2}-[A-Z0-9]{4})", re.I)
+ts_re = re.compile(r"(^|[-_/\\])TS[0-9]*($|[-_.\\/])", re.I)
+bs_re = re.compile(r"(^|[-_/\\])BS[0-9]*($|[-_.\\/])", re.I)
+dx_re = re.compile(r"(^|[-_/\\])DX[0-9]*($|[-_.\\/])", re.I)
+
+def cid_from(name):
+    m = case_re.search(name)
+    return m.group(1).upper() if m else None
+
+def scan(root, regex):
+    out = defaultdict(list)
+    for p in sorted(root.iterdir()):
+        if not p.is_dir() or not regex.search(p.name):
+            continue
+        cid = cid_from(p.name)
+        if cid:
+            out[cid].append(p.name)
+    return out
+
+raw_ts = scan(raw_dir, ts_re)
+raw_bs = scan(raw_dir, bs_re)
+raw_dx = scan(raw_dir, dx_re)
+gen_ts = scan(gen_dir, ts_re)
+
+with label_file.open(newline='') as f:
+    reader = csv.DictReader(f)
+    rows = list(reader)
+    fields = reader.fieldnames
+if not fields:
+    raise SystemExit(f"Empty label file: {label_file}")
+
+case_col = 'CASE_ID' if 'CASE_ID' in fields else fields[0]
+kept, dropped = [], []
+for r in rows:
+    cid = (r.get(case_col) or '').strip().upper()
+    if not cid:
+        dropped.append((cid, 'empty_case_id'))
+        continue
+    raw_ts_names = set(raw_ts.get(cid, []))
+    gen_names = set(gen_ts.get(cid, []))
+    reasons = []
+    if not raw_ts_names:
+        reasons.append('missing_raw_TS')
+    if not raw_bs.get(cid):
+        reasons.append('missing_real_BS')
+    if not raw_dx.get(cid):
+        reasons.append('missing_DX')
+    if not gen_names:
+        reasons.append('missing_GEN_BS_like')
+    missing_exact = sorted(raw_ts_names - gen_names)
+    if missing_exact:
+        reasons.append('missing_GEN_exact_TS_folder_name')
+    if reasons:
+        dropped.append((cid, '|'.join(reasons)))
+    else:
+        kept.append(r)
+
+with out_csv.open('w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=fields)
+    w.writeheader()
+    w.writerows(kept)
+
+with (manifest_dir / 'common_split_filter_report.csv').open('w', newline='') as f:
+    w = csv.writer(f)
+    w.writerow(['case_id','status_or_reason'])
+    for r in kept:
+        w.writerow([(r.get(case_col) or '').strip().upper(), 'kept'])
+    for cid, reason in dropped:
+        w.writerow([cid, reason])
+
+(manifest_dir / 'common_split_dropped_cases.txt').write_text('\n'.join(f'{cid}\t{reason}' for cid, reason in dropped) + ('\n' if dropped else ''))
+print('Common split filtered label file:', out_csv)
+print('Original label rows:', len(rows))
+print('Kept rows:', len(kept))
+print('Dropped rows:', len(dropped))
+print('Dropped examples:', dropped[:20])
+if not kept:
+    raise SystemExit('No cases left after common split filtering')
+PYFILTER
+}
+
 log "============================================================"
-log "Step 1. Create KIRC grade RAG split/cache from RAW GT TS+BS+DX"
+log "Step 1. Create COMMON KIRC grade RAG split/cache from cases with raw TS + real BS + DX + generated BS-like"
 log "============================================================"
 
-# Remove only this grade cache to avoid stale split/label mismatch.
+# Remove only this common grade cache to avoid stale split/label mismatch.
 rm -rf "$RAG_CACHE"
 mkdir -p "$RAG_CACHE"
 
+log "Step 1a. Build filtered label CSV for common GT/GEN fair split"
+make_common_filtered_labels "$RAW_DIR" "$GEN_DIR" "$LABEL_FILE" "$FILTERED_LABEL_FILE"
+
 python -u 01_precompute_rag.py \
   --input-dir "$RAW_DIR" \
-  --label-file "$LABEL_FILE" \
+  --label-file "$FILTERED_LABEL_FILE" \
   --patient-col CASE_ID \
   --label-col label \
   --output-dir "$RAG_CACHE" \
@@ -452,8 +565,8 @@ python -u 01_train.py \
   --preset uni-full \
   --data-path "$DATA_DIR" \
   --rag-cache-dir "$RAG_CACHE" \
-  --label kirc_grade_gt_unifull \
-  --run-tag gt-ts-gt-bs-grade \
+  --label kirc_grade_common_gt_unifull \
+  --run-tag common-gt-ts-gt-bs-grade \
   --out-root "$OUT_ROOT" \
   --batch-size 4 \
   --epochs 200 \
@@ -461,4 +574,4 @@ python -u 01_train.py \
   --checkpoint-every 10 \
   --no-pretrain
 
-log "✅ KIRC grade GT pipeline finished: $(date)"
+log "✅ COMMON KIRC grade GT pipeline finished: $(date)"

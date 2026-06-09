@@ -117,19 +117,19 @@ RAW_DIR="/home/sehwan001/datasets/patches/patches"
 GEN_DIR="/home/sehwan001/datasets/gen_bs"
 
 # Correct label file for KIRC grade binary classification.
-LABEL_FILE="/home/sehwan001/projects/make_dataset/kirc/kirc_grade_labels_binary.csv"
+LABEL_FILE="./rag/kirc_cache_grade_common/manifests/kirc_grade_labels_common_ts_bs_dx_gen.csv"
 
 # Reuse the exact split from the real/GT grade run for fair comparison.
 # This file is created by run_pipeline_gt_grade_fixed.pbs.
-GT_SPLIT_JSON="./rag/kirc_cache_grade/split.json"
+GT_SPLIT_JSON="./rag/kirc_cache_grade_common/split.json"
 
 # Do NOT train directly on RAW_DIR or GEN_DIR. 01_train.py expects trainA/trainB/testA/testB.
 LINK_ROOT="/home/sehwan001/datasets"
-DATA_DIR="$LINK_ROOT/kirc_grade_gt_ts_gen_bs"
+DATA_DIR="$LINK_ROOT/kirc_grade_common_gt_ts_gen_bs"
 
 # Keep GEN cache/output separate from GT cache/output.
-RAG_CACHE="./rag/kirc_cache_grade_gen"
-OUT_ROOT="./outputs/kirc_grade_gen"
+RAG_CACHE="./rag/kirc_cache_grade_common_gen"
+OUT_ROOT="./outputs/kirc_grade_common_gen"
 
 # 1 = rebuild linked trainA/trainB/testA/testB every run.
 # This only removes hardlinks/symlinks under DATA_DIR, not RAW_DIR or GEN_DIR.
@@ -147,7 +147,7 @@ log "OUT_ROOT      : $OUT_ROOT"
 
 [[ -d "$RAW_DIR" ]] || die "RAW_DIR not found: $RAW_DIR"
 [[ -d "$GEN_DIR" ]] || die "GEN_DIR not found: $GEN_DIR"
-[[ -f "$LABEL_FILE" ]] || die "LABEL_FILE not found: $LABEL_FILE"
+[[ -f "$LABEL_FILE" ]] || die "Filtered common LABEL_FILE not found: $LABEL_FILE. Run run_pipeline_gt_grade_common_strict_env_hfcheck.pbs first."
 [[ -f "$GT_SPLIT_JSON" ]] || die "GT split not found: $GT_SPLIT_JSON. Run run_pipeline_gt_grade_fixed.pbs first."
 
 python - "$GT_SPLIT_JSON" "$LABEL_FILE" <<'PY'
@@ -170,7 +170,7 @@ print("Split label counts  :", s.get("label_counts"))
 if Path(src).name and Path(src).name != label_file.name:
     raise SystemExit(
         f"Split label mismatch: split uses {Path(src).name}, but this PBS uses {label_file.name}. "
-        "Use the grade split created from kirc_grade_labels_binary.csv."
+        "Use the common strict grade split created by run_pipeline_gt_grade_common_strict_env_hfcheck.pbs."
     )
 PY
 
@@ -487,6 +487,170 @@ for split, domains in [("train", ["trainA"]), ("test", ["testA"] )]:
 PY
 }
 
+
+
+verify_linked_no_clobber() {
+  local raw_dir="$1"
+  local gen_dir="$2"
+  local split_json="$3"
+  local linked_data="$4"
+
+  python - "$raw_dir" "$gen_dir" "$split_json" "$linked_data" <<'PYVERIFY'
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+raw_dir = Path(sys.argv[1])
+gen_dir = Path(sys.argv[2])
+split_json = Path(sys.argv[3])
+linked_data = Path(sys.argv[4])
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
+case_re = re.compile(r"(TCGA-[A-Z0-9]{2}-[A-Z0-9]{4})", re.I)
+ts_re = re.compile(r"(^|[-_/\\])TS[0-9]*($|[-_.\\/])", re.I)
+
+def case_id(name: str):
+    m = case_re.search(name)
+    return m.group(1).upper() if m else None
+
+def scan_ts(root: Path):
+    out = defaultdict(list)
+    for p in sorted(root.iterdir()):
+        if p.is_dir() and ts_re.search(p.name):
+            cid = case_id(p.name)
+            if cid:
+                out[cid].append(p.name)
+    return out
+
+def image_rel_set(root: Path):
+    if not root.exists():
+        return set()
+    return {
+        str(p.relative_to(root)).replace('\\', '/')
+        for p in root.rglob('*')
+        if p.is_file() and p.suffix.lower() in IMG_EXTS
+    }
+
+def same_file_examples(a: Path, b: Path, rels, limit=10):
+    bad = []
+    for r in sorted(rels):
+        pa, pb = a / r, b / r
+        if pa.exists() and pb.exists():
+            try:
+                if os.path.samefile(pa, pb):
+                    bad.append(r)
+                    if len(bad) >= limit:
+                        break
+            except FileNotFoundError:
+                pass
+    return bad
+
+with split_json.open() as f:
+    split = json.load(f)
+train_ids = [x.upper() for x in split.get('train_patient_ids', [])]
+test_ids = [x.upper() for x in split.get('test_patient_ids', [])]
+all_ids = train_ids + test_ids
+split_of = {cid: 'train' for cid in train_ids}
+split_of.update({cid: 'test' for cid in test_ids})
+raw_ts = scan_ts(raw_dir)
+gen_ts = scan_ts(gen_dir)
+
+failures = []
+checked_pairs = 0
+same_name_pairs = 0
+shared_rel_file_pairs = 0
+for cid in all_ids:
+    sp = split_of[cid]
+    for name in raw_ts.get(cid, []):
+        # In this experiment generated BS-like folders are expected to use the exact TS folder name.
+        if name not in set(gen_ts.get(cid, [])):
+            failures.append(f"missing generated TS-named folder for {name}")
+            continue
+        real_link = linked_data / f"{sp}A" / name
+        gen_link = linked_data / f"{sp}A" / "BS" / name
+        if not real_link.exists():
+            failures.append(f"missing real TS linked folder: {real_link}")
+            continue
+        if not gen_link.exists():
+            failures.append(f"missing generated BS-like linked folder: {gen_link}")
+            continue
+        checked_pairs += 1
+        same_name_pairs += 1
+        real_rels = image_rel_set(real_link)
+        gen_rels = image_rel_set(gen_link)
+        common = real_rels & gen_rels
+        if common:
+            shared_rel_file_pairs += 1
+            bad_samefiles = same_file_examples(real_link, gen_link, common)
+            if bad_samefiles:
+                failures.append(
+                    f"real TS and generated BS-like share the same inode under separated folders for {name}: {bad_samefiles[:5]}"
+                )
+
+# Ensure generated folder container exists and no top-level TCGA BS has leaked into GEN A domain.
+for sp in ["train", "test"]:
+    bs_root = linked_data / f"{sp}A" / "BS"
+    if not bs_root.exists():
+        failures.append(f"missing generated BS container: {bs_root}")
+    leaked = [p.name for p in (linked_data / f"{sp}A").iterdir() if p.is_dir() and re.search(r"(^|[-_/\\])BS[0-9]*($|[-_.\\/])", p.name, re.I)]
+    if leaked:
+        failures.append(f"real BS-like top-level leakage in {sp}A: {leaked[:20]}")
+
+print("No-clobber verification")
+print("  checked real TS / generated BS-like folder pairs:", checked_pairs)
+print("  same basename pairs intentionally separated     :", same_name_pairs)
+print("  pairs with same internal image names             :", shared_rel_file_pairs)
+print("  generated location pattern                       : trainA/BS/<TS-folder>, testA/BS/<TS-folder>")
+
+if failures:
+    print("\n".join(failures[:50]))
+    raise SystemExit("No-clobber verification failed")
+PYVERIFY
+}
+
+assert_rag_alias_clean() {
+  local rag_cache="$1"
+
+  python - "$rag_cache" <<'PYRAGCHECK'
+import sys
+from collections import Counter
+from pathlib import Path
+import torch
+
+rag_cache = Path(sys.argv[1])
+failures = []
+for split in ["train", "test"]:
+    path = rag_cache / split / "rag_lookup.pt"
+    if not path.exists():
+        failures.append(f"missing lookup: {path}")
+        continue
+    obj = torch.load(path, map_location="cpu")
+    names = [str(x).replace("\\", "/") for x in obj.get("fs_filenames", [])]
+    dup = [k for k, v in Counter(names).items() if v > 1]
+    info = obj.get("fs_name2idx_alias_info", {})
+    collision_n = int(info.get("collision_n", 0) or 0)
+    gen_like = sum(("/BS/" in n) or n.startswith("BS/") or n.startswith(f"{split}A/BS/") for n in names)
+    print(f"RAG lookup integrity [{split}]")
+    print(f"  fs_filenames          : {len(names):,}")
+    print(f"  duplicate filenames   : {len(dup):,}")
+    print(f"  generated-like entries: {gen_like:,}")
+    print(f"  alias collisions      : {collision_n:,}")
+    print(f"  linked matched files  : {info.get('linked_matched_files', 'NA')}")
+    if dup:
+        failures.append(f"duplicate fs_filenames in {path}: {dup[:10]}")
+    if collision_n:
+        failures.append(f"alias collisions in {path}: {info.get('collision_examples', [])[:10]}")
+    if gen_like == 0:
+        failures.append(f"no generated-like BS entries detected in {path}; check whether 01_precompute_rag prefixes GEN paths as BS/...")
+
+if failures:
+    print("\n".join(map(str, failures[:50])))
+    raise SystemExit("RAG lookup integrity check failed")
+PYRAGCHECK
+}
+
 log "============================================================"
 log "Step 1. Create KIRC grade GEN RAG cache from RAW GT TS + GEN BS-like + DX, reusing GT grade split"
 log "============================================================"
@@ -649,10 +813,20 @@ log "============================================================"
 assert_train_layout "$DATA_DIR"
 
 log "============================================================"
+log "Step 3b. Verify no overwrite/clobber between real TS and generated BS-like"
+log "============================================================"
+verify_linked_no_clobber "$RAW_DIR" "$GEN_DIR" "$RAG_CACHE/split.json" "$DATA_DIR"
+
+log "============================================================"
 log "Step 4. Add RAG aliases for linked dataset paths"
 log "============================================================"
 
 add_rag_aliases "$RAG_CACHE" "$DATA_DIR"
+
+log "============================================================"
+log "Step 4b. Validate RAG lookup aliases and generated entries"
+log "============================================================"
+assert_rag_alias_clean "$RAG_CACHE"
 
 log "============================================================"
 log "Step 5. Train real TS + generated BS-like -> DX/FFPE with KIRC grade labels"
@@ -662,8 +836,8 @@ python -u 01_train.py \
   --preset uni-full \
   --data-path "$DATA_DIR" \
   --rag-cache-dir "$RAG_CACHE" \
-  --label kirc_grade_gen_unifull \
-  --run-tag gt-ts-gen-bs-grade \
+  --label kirc_grade_common_gen_unifull \
+  --run-tag common-gt-ts-gen-bs-grade \
   --out-root "$OUT_ROOT" \
   --batch-size 4 \
   --epochs 200 \
@@ -671,4 +845,4 @@ python -u 01_train.py \
   --checkpoint-every 10 \
   --no-pretrain
 
-log "✅ KIRC grade GEN pipeline finished: $(date)"
+log "✅ COMMON KIRC grade GEN pipeline finished: $(date)"
